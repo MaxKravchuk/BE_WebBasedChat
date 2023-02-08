@@ -1,18 +1,20 @@
-﻿using System.Collections.Concurrent;
+﻿using BE_Chat.Handlers;
+using BE_Chat.Models;
+using System.Collections.Concurrent;
 using System.Net.WebSockets;
 using System.Text;
+using System.Text.Json;
 
-namespace BE_Chat.Middlewares
+namespace BE_Chat
 {
     public class WebSocketMiddleware
     {
-        private static ConcurrentDictionary<string, WebSocket> _sockets = new ConcurrentDictionary<string, WebSocket>();
-
         private readonly RequestDelegate _next;
-
-        public WebSocketMiddleware(RequestDelegate next)
+        private readonly IWebSocketHandler _handler;
+        public WebSocketMiddleware(RequestDelegate next, IWebSocketHandler handler)
         {
             _next = next;
+            _handler = handler;
         }
 
         public async Task Invoke(HttpContext context)
@@ -23,79 +25,96 @@ namespace BE_Chat.Middlewares
                 return;
             }
 
-            CancellationToken ct = context.RequestAborted;
-            WebSocket currentSocket = await context.WebSockets.AcceptWebSocketAsync();
-            var socketId = Guid.NewGuid().ToString();
+            string username = context.Request.Query["username"];
 
-            _sockets.TryAdd(socketId, currentSocket);
+            WebSocket socket = await context.WebSockets.AcceptWebSocketAsync();
+            await _handler.OnConnected(socket, username);
 
-            while (true)
+            await Receive(socket, async (result, buffer) =>
             {
-                if (ct.IsCancellationRequested)
+                if (result.MessageType == WebSocketMessageType.Text)
                 {
-                    break;
+                    var msg = _handler.ReceiveString(result, buffer);
+
+                    await HandleMessage(socket, msg);
+
+                    return;
                 }
 
-                var response = await ReceiveStringAsync(currentSocket, ct);
-                if (string.IsNullOrEmpty(response))
+                else if (result.MessageType == WebSocketMessageType.Close)
                 {
-                    if (currentSocket.State != WebSocketState.Open)
-                    {
-                        break;
-                    }
-
-                    continue;
+                    await HandleDisconnect(socket);
+                    return;
                 }
 
-                foreach (var socket in _sockets)
-                {
-                    if (socket.Value.State != WebSocketState.Open)
-                    {
-                        continue;
-                    }
+            });
+        }
 
-                    await SendStringAsync(socket.Value, response, ct);
-                }
+        private async Task HandleDisconnect(WebSocket socket)
+        {
+            string disconnectedUser = await _handler.OnDisconnected(socket);
+
+            ServerMessage disconnectMessage = new ServerMessage(disconnectedUser, true, _handler.GetAllUsers());
+
+            await _handler.BroadcastMessage(JsonSerializer.Serialize(disconnectMessage));
+        }
+
+        private async Task HandleMessage(WebSocket socket, string message)
+        {
+            ClientMessage clientMessage = TryDeserializeClientMessage(message);
+
+            if (clientMessage == null)
+            {
+                return;
             }
 
-            WebSocket dummy;
-            _sockets.TryRemove(socketId, out dummy);
-
-            await currentSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", ct);
-            currentSocket.Dispose();
-        }
-
-        private static Task SendStringAsync(WebSocket socket, string data, CancellationToken ct = default)
-        {
-            var buffer = Encoding.UTF8.GetBytes(data);
-            var segment = new ArraySegment<byte>(buffer);
-            return socket.SendAsync(segment, WebSocketMessageType.Text, true, ct);
-        }
-
-        private static async Task<string> ReceiveStringAsync(WebSocket socket, CancellationToken ct = default)
-        {
-            var buffer = new ArraySegment<byte>(new byte[8192]);
-            using (var ms = new MemoryStream())
+            if (clientMessage.IsTypeConnection())
             {
-                WebSocketReceiveResult result;
-                do
-                {
-                    ct.ThrowIfCancellationRequested();
+                // For future improvements
+            }
+            else if (clientMessage.IsTypeChat())
+            {
+                string expectedUsername = _handler.GetUsernameBySocket(socket);
 
-                    result = await socket.ReceiveAsync(buffer, ct);
-                    ms.Write(buffer.Array, buffer.Offset, result.Count);
+                if (clientMessage.IsValid(expectedUsername))
+                {
+                    ServerMessage chatMessage = new ServerMessage(clientMessage);
+                    await _handler.BroadcastMessage(JsonSerializer.Serialize(chatMessage));
                 }
-                while (!result.EndOfMessage);
+            }
+        }
 
-                ms.Seek(0, SeekOrigin.Begin);
-                if (result.MessageType != WebSocketMessageType.Text)
+        private ClientMessage TryDeserializeClientMessage(string str)
+        {
+            try
+            {
+                return JsonSerializer.Deserialize<ClientMessage>(str);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: invalid message format");
+                return null;
+            }
+        }
+
+        private async Task Receive(WebSocket socket, Action<WebSocketReceiveResult, byte[]> handleMessage)
+        {
+            var buffer = new byte[1024 * 4];
+
+            try
+            {
+                while (socket.State == WebSocketState.Open)
                 {
-                    return null;
+                    var result = await socket.ReceiveAsync(buffer: new ArraySegment<byte>(buffer),
+                                                           cancellationToken: CancellationToken.None);
+
+                    handleMessage(result, buffer);
                 }
-                using (var reader = new StreamReader(ms, Encoding.UTF8))
-                {
-                    return await reader.ReadToEndAsync();
-                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+                await HandleDisconnect(socket);
             }
         }
     }
