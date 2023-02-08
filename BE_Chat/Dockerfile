@@ -10,9 +10,8 @@ RUN dotnet restore "./BE_Chat.csproj"
 COPY . .
 WORKDIR "/src/."
 RUN dotnet build "BE_Chat.csproj" -c Release -o /app/build
-
 FROM build AS publish
-RUN dotnet publish "BE_Chat.csproj" -c Release -o /app/publish /p:UseAppHost=false
+RUN dotnet publish "BE_Chat.csproj" -c Release -o /app/publish
 
 FROM base AS final
 WORKDIR /app
