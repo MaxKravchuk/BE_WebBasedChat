@@ -1,6 +1,11 @@
-﻿namespace BE_Chat.Handlers
+﻿using BE_Chat.Services;
+
+namespace BE_Chat.Handlers
 {
-    public class ChatHandler
+    public class ChatHandler : WebSocketHandler
     {
+        public ChatHandler(ConnectionService connectionManager) : base(connectionManager)
+        {
+        }
     }
 }
